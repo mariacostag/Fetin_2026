@@ -1,0 +1,283 @@
+"""
+Script de TREINAMENTO da IA de previsão de desabastecimento.
+
+Parte de onde o `gerar_12_meses.py` parou: pega o dataset com os 12 meses
+simulados (Código, Nome, Forma farmacêutica, Concentração, Quantidade
+anual, Consumo mensal, Mês, Histórico de reposição, Histórico de
+consumo, Estoque) e faz 3 coisas:
+
+  1. Calcula as 5 SAÍDAS que vocês definiram (rótulos/targets):
+     - probabilidade_desabastecimento
+     - classificacao_risco (baixo/medio/alto/critico)
+     - quantidade_recomendada_reposicao
+     - autonomia_estoque_dias
+     - dias_ate_ruptura  (a "data estimada de ruptura" é dias_ate_ruptura
+       somado à data do mês -- ver observação no final do script)
+
+  2. Monta as FEATURES de entrada usando só o que seria conhecido ANTES do
+     mês em questão (estoque/consumo/reposição do mês anterior), evitando
+     vazamento de dados (data leakage).
+
+  3. Treina os modelos:
+     - RandomForestClassifier -> classificacao_risco
+     - RandomForestRegressor  -> probabilidade_desabastecimento,
+                                  quantidade_recomendada_reposicao,
+                                  autonomia_estoque_dias,
+                                  dias_ate_ruptura
+
+Como usar no Google Colab:
+1. Suba o arquivo com os 12 meses (ex: "Medicamentos_TODOS_12MESES.csv").
+2. Rode este script.
+3. Ele mostra as métricas de avaliação e salva os modelos treinados
+   (arquivos .joblib) para uso posterior.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    mean_absolute_error, r2_score,
+)
+import joblib
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+CAMINHO_DATASET_12MESES = "/content/Medicamentos_TODOS_12MESES.csv"
+ENCODING_CSV = "latin-1"
+
+COL_CODIGO = "Código do medicamento"
+COL_NOME = "Nome do medicamento"
+COL_FORMA_FARMACEUTICA = "Forma farmacêutica"
+COL_CONCENTRACAO = "Concentração"
+COL_QTD_ANUAL = "Quantidade anual"
+COL_CONSUMO_MENSAL = "Consumo mensal"
+COL_MES = "Mês"
+COL_HIST_REPOSICAO = "Histórico de reposição"
+COL_HIST_CONSUMO = "Histórico de consumo"
+COL_ESTOQUE = "Estoque"
+
+# Mesmos cortes de risco já calibrados com vocês
+CORTE_RISCO_BAIXO = 60
+CORTE_RISCO_MEDIO = 30
+CORTE_RISCO_ALTO = 10
+COBERTURA_SEGURANCA_DIAS = 75  # 2.5 meses x 30 dias (mesma calibração do gerar_12_meses.py)
+COBERTURA_ALVO_REPOSICAO_MESES = 2.5
+
+SEED = 42
+
+
+# ============================================================
+# 1. CALCULAR AS 5 SAÍDAS (RÓTULOS) A PARTIR DO MÊS ATUAL
+# ============================================================
+
+def calcular_rotulos(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    consumo_diario_medio = df[COL_HIST_CONSUMO] / 30
+    consumo_diario_medio = consumo_diario_medio.replace(0, np.nan)
+
+    autonomia_dias = (df[COL_ESTOQUE] / consumo_diario_medio).fillna(999).clip(upper=999)
+    df["autonomia_estoque_dias"] = autonomia_dias.round(1)
+
+    x = (COBERTURA_SEGURANCA_DIAS - autonomia_dias) / (COBERTURA_SEGURANCA_DIAS / 2)
+    probabilidade = 1 / (1 + np.exp(-x))
+    df["probabilidade_desabastecimento"] = probabilidade.clip(0, 1).round(4)
+
+    def classificar(autonomia):
+        if autonomia > CORTE_RISCO_BAIXO:
+            return "baixo"
+        elif autonomia > CORTE_RISCO_MEDIO:
+            return "medio"
+        elif autonomia > CORTE_RISCO_ALTO:
+            return "alto"
+        return "critico"
+
+    df["classificacao_risco"] = autonomia_dias.apply(classificar)
+
+    alvo_reposicao = df[COL_CONSUMO_MENSAL] * COBERTURA_ALVO_REPOSICAO_MESES
+    df["quantidade_recomendada_reposicao"] = (alvo_reposicao - df[COL_ESTOQUE]).clip(lower=0).round(2)
+
+    df["dias_ate_ruptura"] = autonomia_dias.round(1)  # dias a partir do fim do mês atual
+
+    return df
+
+
+# ============================================================
+# 2. MONTAR FEATURES COM DEFASAGEM (evita vazamento de dados)
+# ============================================================
+
+def montar_features_com_defasagem(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Para cada medicamento, ordena por mês e desloca (shift) o estoque,
+    consumo e reposição em 1 mês -- assim, a entrada do modelo para
+    prever o mês M usa dados até o mês M-1, nunca o próprio mês M.
+    """
+    df = df.sort_values([COL_CODIGO, COL_MES]).copy()
+
+    grupo = df.groupby(COL_CODIGO)
+    df["estoque_mes_anterior"] = grupo[COL_ESTOQUE].shift(1)
+    df["consumo_mes_anterior"] = grupo[COL_HIST_CONSUMO].shift(1)
+    df["reposicao_mes_anterior"] = grupo[COL_HIST_REPOSICAO].shift(1)
+
+    # O mês 1 não tem mês anterior dentro do próprio ano -- preenche com
+    # uma estimativa neutra (estoque de segurança planejado / consumo médio)
+    estoque_inicial_estimado = df[COL_CONSUMO_MENSAL] * COBERTURA_ALVO_REPOSICAO_MESES
+    df["estoque_mes_anterior"] = df["estoque_mes_anterior"].fillna(estoque_inicial_estimado)
+    df["consumo_mes_anterior"] = df["consumo_mes_anterior"].fillna(df[COL_CONSUMO_MENSAL])
+    df["reposicao_mes_anterior"] = df["reposicao_mes_anterior"].fillna(df[COL_CONSUMO_MENSAL])
+
+    return df
+
+
+# ============================================================
+# 3. TREINAMENTO
+# ============================================================
+
+def main():
+    df = pd.read_csv(CAMINHO_DATASET_12MESES, encoding=ENCODING_CSV)
+
+    df = calcular_rotulos(df)
+
+    # Exporta o dataset com as 5 colunas de saída (rótulos) já calculadas
+    CAMINHO_SAIDA_CSV = "/content/Medicamentos_2024_Planilha1_12MESES_COM_SAIDAS.csv"
+    df.to_csv(CAMINHO_SAIDA_CSV, index=False, encoding=ENCODING_CSV)
+    print(f"\nDataset com as 5 colunas de saída exportado para: {CAMINHO_SAIDA_CSV}")
+
+    df = montar_features_com_defasagem(df)
+
+    # --- Features de entrada (só o que é conhecido ANTES do mês em questão) ---
+    colunas_categoricas = [COL_FORMA_FARMACEUTICA]
+    colunas_numericas = [
+        COL_QTD_ANUAL, COL_CONSUMO_MENSAL, COL_MES,
+        "estoque_mes_anterior", "consumo_mes_anterior", "reposicao_mes_anterior",
+    ]
+
+    # Codifica a variável categórica (forma farmacêutica)
+    encoders = {}
+    df_features = df.copy()
+    for col in colunas_categoricas:
+        le = LabelEncoder()
+        df_features[col + "_cod"] = le.fit_transform(df_features[col].astype(str))
+        encoders[col] = le
+
+    colunas_features_finais = colunas_numericas + [c + "_cod" for c in colunas_categoricas]
+    X = df_features[colunas_features_finais]
+
+    # --- Divisão treino/teste por TEMPO (meses 1-9 treino, 10-12 teste) ---
+    # Isso simula a situação real: treinar com o passado, testar se prevê
+    # o "futuro" -- mais realista do que embaralhar tudo aleatoriamente.
+    treino_mask = df_features[COL_MES] <= 9
+    teste_mask = df_features[COL_MES] > 9
+
+    X_treino, X_teste = X[treino_mask], X[teste_mask]
+
+    resultados = {}
+
+    # --- Modelo 1: Classificação de risco ---
+    y_risco = df_features["classificacao_risco"]
+    y_risco_treino, y_risco_teste = y_risco[treino_mask], y_risco[teste_mask]
+
+    modelo_risco = RandomForestClassifier(n_estimators=200, random_state=SEED)
+    modelo_risco.fit(X_treino, y_risco_treino)
+    pred_risco = modelo_risco.predict(X_teste)
+
+    acuracia = accuracy_score(y_risco_teste, pred_risco)
+    relatorio = classification_report(y_risco_teste, pred_risco, zero_division=0, output_dict=True)
+
+    print("\n" + "=" * 60)
+    print("COMO ESTÁ A IA PREVENDO O NÍVEL DE RISCO?")
+    print("=" * 60)
+    print(f"De cada 10 previsões de risco (baixo/médio/alto/crítico), a IA acerta {round(acuracia * 10)}.")
+    print()
+    print("Olhando categoria por categoria (o quanto a IA acerta em cada uma):")
+    nomes_categorias = {"baixo": "Risco baixo", "medio": "Risco médio", "alto": "Risco alto", "critico": "Risco crítico"}
+    for chave, nome in nomes_categorias.items():
+        if chave in relatorio:
+            acerto_categoria = relatorio[chave]["recall"]
+            qtd_casos = int(relatorio[chave]["support"])
+            print(f"  - {nome:14s}: acertou {acerto_categoria * 100:.0f}% dos {qtd_casos} casos reais dessa categoria")
+    print()
+    print("O que isso quer dizer na prática: quanto mais próximo de 100% em")
+    print("'Risco crítico', melhor -- é a categoria mais importante de acertar,")
+    print("pois representa risco real de falta do medicamento.")
+
+    joblib.dump(modelo_risco, "modelo_classificacao_risco.joblib")
+
+    # --- Modelos de regressão (um para cada saída numérica) ---
+    alvos_regressao = {
+        "probabilidade_desabastecimento": {
+            "arquivo": "modelo_probabilidade.joblib",
+            "nome_amigavel": "Probabilidade de desabastecimento",
+            "unidade": "pontos percentuais (%)",
+            "escala_percentual": True,
+        },
+        "quantidade_recomendada_reposicao": {
+            "arquivo": "modelo_quantidade_reposicao.joblib",
+            "nome_amigavel": "Quantidade recomendada de reposição",
+            "unidade": "unidades do medicamento",
+            "escala_percentual": False,
+        },
+        "autonomia_estoque_dias": {
+            "arquivo": "modelo_autonomia.joblib",
+            "nome_amigavel": "Autonomia do estoque",
+            "unidade": "dias",
+            "escala_percentual": False,
+        },
+        "dias_ate_ruptura": {
+            "arquivo": "modelo_dias_ate_ruptura.joblib",
+            "nome_amigavel": "Dias até a ruptura do estoque",
+            "unidade": "dias",
+            "escala_percentual": False,
+        },
+    }
+
+    print("\n" + "=" * 60)
+    print("COMO ESTÁ A IA PREVENDO OS NÚMEROS (reposição, autonomia, etc.)?")
+    print("=" * 60)
+
+    for nome_alvo, info in alvos_regressao.items():
+        y = df_features[nome_alvo]
+        y_treino, y_teste = y[treino_mask], y[teste_mask]
+
+        modelo = RandomForestRegressor(n_estimators=200, random_state=SEED)
+        modelo.fit(X_treino, y_treino)
+        pred = modelo.predict(X_teste)
+
+        mae = mean_absolute_error(y_teste, pred)
+        r2 = r2_score(y_teste, pred)
+        qualidade_pct = max(0, r2) * 100  # % do padrão real que a IA já entendeu
+
+        print(f"\n>> {info['nome_amigavel']}")
+        if info["escala_percentual"]:
+            print(f"   Erro médio: a IA erra, em média, {mae * 100:.1f} pontos percentuais para mais ou para menos.")
+        else:
+            print(f"   Erro médio: a IA erra, em média, {mae:,.0f} {info['unidade']} para mais ou para menos.")
+        print(f"   Qualidade do aprendizado: a IA já entendeu {qualidade_pct:.0f}% do padrão real dessa previsão.")
+
+        joblib.dump(modelo, info["arquivo"])
+        resultados[nome_alvo] = {"mae": mae, "r2": r2}
+
+    print("\n" + "=" * 60)
+    print("RESUMO GERAL")
+    print("=" * 60)
+    print(f"- Classificação de risco: acerta {acuracia * 100:.0f}% das vezes")
+    for nome_alvo, info in alvos_regressao.items():
+        qualidade_pct = max(0, resultados[nome_alvo]["r2"]) * 100
+        print(f"- {info['nome_amigavel']}: {qualidade_pct:.0f}% de qualidade de aprendizado")
+    print("\nLembrete: esse resultado é com só 1 ano de dado simulado (2024).")
+    print("Tende a melhorar quando 2023, 2025 e 2026 forem somados à base.")
+
+    # Salva também o encoder da forma farmacêutica, necessário para usar
+    # os modelos depois com dados novos
+    joblib.dump(encoders, "encoders.joblib")
+
+    print("\nTodos os modelos foram salvos (.joblib) para uso posterior.")
+    return modelo_risco, resultados
+
+
+if __name__ == "__main__":
+    modelo_risco, resultados = main()
