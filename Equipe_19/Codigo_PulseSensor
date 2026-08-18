@@ -1,0 +1,153 @@
+#include <Arduino.h>
+
+const int sensorPin = 34;  //pino do PulseSensor (GPIO34 - ADC1_CH6, entrada apenas analógica)
+const int ledPin = 32;     //pino do LED de alerta (bradicardia/taquicardia) - GPIO32, próximo ao GPIO34 e com suporte a saída digital
+const int botaoPin = 33;   //pino do push button - GPIO33, próximo ao GPIO32/34, com suporte a pull-up interno
+
+// === Parâmetros para cálculo do BPM ===
+const int janela = 10; //tamanho da janela do filtro média móvel
+int buffer[janela];
+int bufIndex = 0;
+float somaJanela = 0;
+
+const float fatorLimiar = 0.7; //sensibilidade do threshold para detecção do pico do ECG (Ex: 70% do valor máximo)
+const unsigned long tempoAtualizacao = 5000; //tempo de leitura do ECG para cada canal (ms)
+const int NUM_PICOS_PARA_BPM = 10;  //quantos picos deve identificar antes do calculo do bpm médio
+unsigned long temposEntrePicos[NUM_PICOS_PARA_BPM];
+
+const float BPM_BRADICARDIA = 60.0;  //abaixo disso, em repouso, é considerado bradicardia
+const float BPM_TAQUICARDIA = 100.0; //acima disso, em repouso, é considerado taquicardia
+const unsigned long periodoRefratario = 300; //tempo mínimo (ms) entre picos válidos (evita falsos positivos por ruído). 300ms = até 200 BPM
+
+//Auxiliares e marcação no gráfico
+float media = 0;
+float maxVal = 0;
+float limiar = 0;
+unsigned long tempoUltimaAtualizacao = 0;
+unsigned long tempoUltimaImpressao = 0;
+const unsigned long intervaloImpressao = 1000; //intervalo entre impressões no Serial Monitor (ms). Aumente para deixar mais lento.
+bool acimaLimiar = false;
+int marcador = 0;
+unsigned long ultimoPico = 0;
+int contagemPicos = 0;
+float bpm = 0;
+
+// ==== Funções Auxiliares ====
+float FiltroMediaMovel(int leitura) {
+  somaJanela -= buffer[bufIndex];
+  buffer[bufIndex] = leitura;
+  somaJanela += leitura;
+  bufIndex = (bufIndex + 1) % janela;
+  return somaJanela / janela;
+}
+
+void AtualizaLimiar() {
+  float maxTemp = 0;
+  float mediaTotal = 0;
+
+  for (int i = 0; i < janela; i++) {
+    buffer[i] = 0;
+  }
+  bufIndex = 0;
+  somaJanela = 0;
+
+  for (int i = 0; i < 250; i++) {
+    int leitura = analogRead(sensorPin);
+    float leituraFiltrada = FiltroMediaMovel(leitura);
+    mediaTotal += leituraFiltrada;
+    if (leituraFiltrada > maxTemp) {
+      maxTemp = leituraFiltrada;
+    }
+    delay(4);
+  }
+
+  media = mediaTotal / 250.0;
+  maxVal = maxTemp;
+  limiar = media + fatorLimiar * (maxVal - media);
+}
+
+void CalculaBPM(float sinal) {
+  marcador = 0;
+
+  if (sinal > limiar && !acimaLimiar) {
+    acimaLimiar = true;
+
+    unsigned long agora = millis();
+
+    //Ignora picos detectados rápido demais (ruído, não é um batimento real)
+    if (ultimoPico > 0 && (agora - ultimoPico) < periodoRefratario) {
+      return;
+    }
+
+    marcador = 520;
+
+    if (ultimoPico > 0) {
+      unsigned long intervalo = agora - ultimoPico;
+      temposEntrePicos[contagemPicos % NUM_PICOS_PARA_BPM] = intervalo;
+      contagemPicos++;
+
+      if (contagemPicos >= NUM_PICOS_PARA_BPM) {
+        float soma = 0;
+        for (int i = 0; i < NUM_PICOS_PARA_BPM; i++) {
+          soma += temposEntrePicos[i];
+        }
+        bpm = 60000.0 / (soma / NUM_PICOS_PARA_BPM);
+      }
+    }
+    ultimoPico = agora;
+  }
+
+  if (sinal < limiar) {
+    acimaLimiar = false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  pinMode(botaoPin, INPUT_PULLUP); //usa resistor de pull-up interno do ESP32 - botão só precisa de 2 terminais (pino + GND)
+
+  analogReadResolution(12);           // ESP32: ADC de 12 bits (0-4095)
+  analogSetAttenuation(ADC_11db);     // Permite ler até ~3.3V no pino (faixa completa do sinal do PulseSensor)
+
+  AtualizaLimiar();
+}
+
+void loop() {
+  if (millis() - tempoUltimaAtualizacao > tempoAtualizacao) {
+    AtualizaLimiar();
+    tempoUltimaAtualizacao = millis();
+  }
+
+  int leitura = analogRead(sensorPin);
+  float sinal = FiltroMediaMovel(leitura);
+
+  CalculaBPM(sinal);
+
+  bool botaoPressionado = (digitalRead(botaoPin) == LOW); //com INPUT_PULLUP, o pino fica LOW quando o botão é pressionado (aterrado)
+
+  //botão pressionado força o LED aceso, independente do BPM
+  //caso contrário, segue a lógica normal de bradicardia/taquicardia
+  if (botaoPressionado) {
+    digitalWrite(ledPin, HIGH);
+  } else if (bpm > 0 && (bpm < BPM_BRADICARDIA || bpm > BPM_TAQUICARDIA)) {
+    digitalWrite(ledPin, HIGH);
+  } else {
+    digitalWrite(ledPin, LOW);
+  }
+
+  if (millis() - tempoUltimaImpressao >= intervaloImpressao) {
+    tempoUltimaImpressao = millis();
+    Serial.print("ADC: "); Serial.print(sinal);
+    Serial.print("\tBPM: "); Serial.print(bpm);
+
+    if (botaoPressionado) {
+      Serial.print("\t*** EMERGENCIA ***");
+    }
+
+    Serial.println();
+  }
+}
