@@ -1,28 +1,32 @@
-#include <Arduino.h>
+#include <Arduino.h> //biblioteca
 
-const int sensorPin = 34;  //pino do PulseSensor (GPIO34 - ADC1_CH6, entrada apenas analógica)
-const int ledPin = 32;     //pino do LED de alerta (bradicardia/taquicardia) - GPIO32, próximo ao GPIO34 e com suporte a saída digital
-const int botaoPin = 33;   //pino do push button - GPIO33, próximo ao GPIO32/34, com suporte a pull-up interno
+//Declaração dos pinos usados
+const int sensorPin = 34; //pino do PulseSensor (entrada analógica)
+const int ledPin = 32;    //pino do LED de alerta (bradicardia/taquicardia) (saída digital)
+const int botaoPin = 33;  //pino do push button (entrada digital)
 
-// === Parâmetros para cálculo do BPM ===
-const int janela = 10; //tamanho da janela do filtro média móvel
-int buffer[janela];
+//Parâmetros do filtro de média movel
+const int janela = 10; //quantas amostras entram na média
+int buffer[janela]; //guarda as amostras
 int bufIndex = 0;
-float somaJanela = 0;
+float somaJanela = 0; //soma das 10 amostras
 
+//Parâmetros para detecção de pico e BPM
 const float fatorLimiar = 0.7; //sensibilidade do threshold para detecção do pico do ECG (Ex: 70% do valor máximo)
-const unsigned long tempoAtualizacao = 5000; //tempo de leitura do ECG para cada canal (ms)
-const int NUM_PICOS_PARA_BPM = 10;  //quantos picos deve identificar antes do calculo do bpm médio
-unsigned long temposEntrePicos[NUM_PICOS_PARA_BPM];
+const unsigned long tempoAtualizacao = 5000; //a cada 5s o limiar é recalculado
+const int NUM_PICOS_PARA_BPM = 10;  //quantos picos deve identificar para calcular a média
+unsigned long temposEntrePicos[NUM_PICOS_PARA_BPM]; //array para guardar o tempo entre cada batimento
 
+//Limites clínicos
 const float BPM_BRADICARDIA = 60.0;  //abaixo disso, em repouso, é considerado bradicardia
 const float BPM_TAQUICARDIA = 100.0; //acima disso, em repouso, é considerado taquicardia
 const unsigned long periodoRefratario = 300; //tempo mínimo (ms) entre picos válidos (evita falsos positivos por ruído). 300ms = até 200 BPM
 
-const int CLIQUES_PARA_EMERGENCIA = 5; //quantidade de cliques no botão para gerar uma emergência (estilo smartwatch)
-const unsigned long janelaCliques = 3000; //tempo máximo (ms) para completar os 5 cliques, senão a contagem reinicia
-const unsigned long tempoDebounce = 50; //tempo (ms) para ignorar ruído mecânico do botão (bounce)
-const unsigned long tempoParaCancelarEmergencia = 2000; //segurar o botão por esse tempo (ms) cancela a emergência ativa
+//Parâmetros do botão de emergência
+const int CLIQUES_PARA_EMERGENCIA = 5; //quantidade de cliques no botão para gerar uma emergência
+const unsigned long janelaCliques = 4000; //tempo máximo para completar os 5 cliques
+const unsigned long tempoDebounce = 50; //tempo (ms) para ignorar ruído mecânico do botão
+const unsigned long tempoParaCancelarEmergencia = 2000; //segurar o botão por 2s cancela a emergência ativa
 
 //Auxiliares e marcação no gráfico
 float media = 0;
@@ -31,29 +35,29 @@ float limiar = 0;
 unsigned long tempoUltimaAtualizacao = 0;
 unsigned long tempoUltimaImpressao = 0;
 const unsigned long intervaloImpressao = 1000; //intervalo entre impressões no Serial Monitor (ms). Aumente para deixar mais lento.
-bool acimaLimiar = false;
-int marcador = 0;
+bool acimaLimiar = false; //indica se o sinal está acima do limiar
+int marcador = 0; //identificar onde ocorreu o pico
 unsigned long ultimoPico = 0;
-int contagemPicos = 0;
-float bpm = 0;
+int contagemPicos = 0; //contador de picos
+float bpm = 0; //contador de bpm
 
 //Controle do botão (debounce e contagem de cliques)
 bool estadoBotaoAtual = HIGH;
 bool estadoBotaoAnterior = HIGH;
 unsigned long tempoUltimoDebounce = 0;
-unsigned long tempoInicioPressao = 0;
+unsigned long tempoInicioPressao = 0; //instante que o botão for pressionado
 
 int contadorCliques = 0;
 unsigned long tempoPrimeiroClique = 0;
-bool emergenciaAtiva = false;
+bool emergenciaAtiva = false; //liga ou desliga o modo emergência
 
-// ==== Funções Auxiliares ====
+//Funções Auxiliares
 float FiltroMediaMovel(int leitura) {
   somaJanela -= buffer[bufIndex];
   buffer[bufIndex] = leitura;
   somaJanela += leitura;
-  bufIndex = (bufIndex + 1) % janela;
-  return somaJanela / janela;
+  bufIndex = (bufIndex + 1) % janela; //guarda a nova leitura
+  return somaJanela / janela; //média das 10 amostras
 }
 
 void AtualizaLimiar() {
@@ -66,19 +70,19 @@ void AtualizaLimiar() {
   bufIndex = 0;
   somaJanela = 0;
 
-  for (int i = 0; i < 250; i++) {
+  for (int i = 0; i < 250; i++) { //faz 250 leituras em 1s
     int leitura = analogRead(sensorPin);
-    float leituraFiltrada = FiltroMediaMovel(leitura);
+    float leituraFiltrada = FiltroMediaMovel(leitura); //filtra os valores
     mediaTotal += leituraFiltrada;
     if (leituraFiltrada > maxTemp) {
-      maxTemp = leituraFiltrada;
+      maxTemp = leituraFiltrada; //guarda o maior valor
     }
     delay(4);
   }
 
   media = mediaTotal / 250.0;
   maxVal = maxTemp;
-  limiar = media + fatorLimiar * (maxVal - media);
+  limiar = media + fatorLimiar * (maxVal - media); //define o novo limiar
 }
 
 void CalculaBPM(float sinal) {
@@ -101,6 +105,7 @@ void CalculaBPM(float sinal) {
       temposEntrePicos[contagemPicos % NUM_PICOS_PARA_BPM] = intervalo;
       contagemPicos++;
 
+      //Assim que tiver 10 intervalos, calcula a média e converte para bpm
       if (contagemPicos >= NUM_PICOS_PARA_BPM) {
         float soma = 0;
         for (int i = 0; i < NUM_PICOS_PARA_BPM; i++) {
@@ -145,6 +150,7 @@ void VerificaBotao() {
           tempoPrimeiroClique = agora;
         }
 
+        //Ao atingir 5 cliques, zera o contador e avisa no serial
         if (contadorCliques >= CLIQUES_PARA_EMERGENCIA) {
           emergenciaAtiva = true;
           contadorCliques = 0;
@@ -166,30 +172,35 @@ void VerificaBotao() {
   estadoBotaoAnterior = leituraBotao;
 }
 
+
+//Setup
+//Inicia a comunicação Serial
 void setup() {
   Serial.begin(115200);
 
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW);
+  pinMode(ledPin, OUTPUT); //configura o LED como saída
+  digitalWrite(ledPin, LOW); //led começa apagado
 
   pinMode(botaoPin, INPUT_PULLUP); //usa resistor de pull-up interno do ESP32 - botão só precisa de 2 terminais (pino + GND)
 
-  analogReadResolution(12);           // ESP32: ADC de 12 bits (0-4095)
-  analogSetAttenuation(ADC_11db);     // Permite ler até ~3.3V no pino (faixa completa do sinal do PulseSensor)
+  analogReadResolution(12); // ESP32: ADC de 12 bits (0-4095)
+  analogSetAttenuation(ADC_11db); // permite ler até ~3.3V no pino (faixa completa do sinal do PulseSensor)
 
   AtualizaLimiar();
 }
 
+//Loop
 void loop() {
+  //A cada 5 segundos, recalibra o limiar
   if (millis() - tempoUltimaAtualizacao > tempoAtualizacao) {
     AtualizaLimiar();
     tempoUltimaAtualizacao = millis();
   }
 
-  int leitura = analogRead(sensorPin);
-  float sinal = FiltroMediaMovel(leitura);
+  int leitura = analogRead(sensorPin); //lê o sensor
+  float sinal = FiltroMediaMovel(leitura); //aplica o filtro de média móvel
 
-  CalculaBPM(sinal);
+  CalculaBPM(sinal); //processa o sinal filtrado para detectar picos e calcular bpm
 
   VerificaBotao();
 
@@ -203,6 +214,7 @@ void loop() {
     digitalWrite(ledPin, LOW);
   }
 
+  //Imprime o bpm no Serial a cada 1s
   if (millis() - tempoUltimaImpressao >= intervaloImpressao) {
     tempoUltimaImpressao = millis();
     Serial.print("ADC: "); Serial.print(sinal);
