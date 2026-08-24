@@ -19,6 +19,11 @@ const float BPM_BRADICARDIA = 60.0;  //abaixo disso, em repouso, é considerado 
 const float BPM_TAQUICARDIA = 100.0; //acima disso, em repouso, é considerado taquicardia
 const unsigned long periodoRefratario = 300; //tempo mínimo (ms) entre picos válidos (evita falsos positivos por ruído). 300ms = até 200 BPM
 
+const int CLIQUES_PARA_EMERGENCIA = 5; //quantidade de cliques no botão para gerar uma emergência (estilo smartwatch)
+const unsigned long janelaCliques = 3000; //tempo máximo (ms) para completar os 5 cliques, senão a contagem reinicia
+const unsigned long tempoDebounce = 50; //tempo (ms) para ignorar ruído mecânico do botão (bounce)
+const unsigned long tempoParaCancelarEmergencia = 2000; //segurar o botão por esse tempo (ms) cancela a emergência ativa
+
 //Auxiliares e marcação no gráfico
 float media = 0;
 float maxVal = 0;
@@ -31,6 +36,16 @@ int marcador = 0;
 unsigned long ultimoPico = 0;
 int contagemPicos = 0;
 float bpm = 0;
+
+//Controle do botão (debounce e contagem de cliques)
+bool estadoBotaoAtual = HIGH;
+bool estadoBotaoAnterior = HIGH;
+unsigned long tempoUltimoDebounce = 0;
+unsigned long tempoInicioPressao = 0;
+
+int contadorCliques = 0;
+unsigned long tempoPrimeiroClique = 0;
+bool emergenciaAtiva = false;
 
 // ==== Funções Auxiliares ====
 float FiltroMediaMovel(int leitura) {
@@ -102,6 +117,55 @@ void CalculaBPM(float sinal) {
   }
 }
 
+void VerificaBotao() {
+  bool leituraBotao = digitalRead(botaoPin);
+
+  //debounce: só considera mudança de estado depois de um tempo estável
+  if (leituraBotao != estadoBotaoAnterior) {
+    tempoUltimoDebounce = millis();
+  }
+
+  if ((millis() - tempoUltimoDebounce) > tempoDebounce) {
+    if (leituraBotao != estadoBotaoAtual) {
+      estadoBotaoAtual = leituraBotao;
+
+      if (estadoBotaoAtual == LOW) {
+        //borda de descida = botão acabou de ser pressionado
+        tempoInicioPressao = millis();
+
+        unsigned long agora = millis();
+        if (contadorCliques == 0 || (agora - tempoPrimeiroClique) <= janelaCliques) {
+          if (contadorCliques == 0) {
+            tempoPrimeiroClique = agora;
+          }
+          contadorCliques++;
+        } else {
+          //passou da janela de tempo, reinicia a contagem com esse clique
+          contadorCliques = 1;
+          tempoPrimeiroClique = agora;
+        }
+
+        if (contadorCliques >= CLIQUES_PARA_EMERGENCIA) {
+          emergenciaAtiva = true;
+          contadorCliques = 0;
+          Serial.println("*** EMERGENCIA ACIONADA (5 cliques) ***");
+        }
+      }
+    }
+  }
+
+  //segurar o botão pressionado por tempoParaCancelarEmergencia cancela a emergência
+  if (emergenciaAtiva && estadoBotaoAtual == LOW) {
+    if ((millis() - tempoInicioPressao) >= tempoParaCancelarEmergencia) {
+      emergenciaAtiva = false;
+      contadorCliques = 0;
+      Serial.println("*** EMERGENCIA CANCELADA (botão segurado) ***");
+    }
+  }
+
+  estadoBotaoAnterior = leituraBotao;
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -127,11 +191,11 @@ void loop() {
 
   CalculaBPM(sinal);
 
-  bool botaoPressionado = (digitalRead(botaoPin) == LOW); //com INPUT_PULLUP, o pino fica LOW quando o botão é pressionado (aterrado)
+  VerificaBotao();
 
-  //botão pressionado força o LED aceso, independente do BPM
+  //emergência ativa (5 cliques) força o LED aceso, independente do BPM
   //caso contrário, segue a lógica normal de bradicardia/taquicardia
-  if (botaoPressionado) {
+  if (emergenciaAtiva) {
     digitalWrite(ledPin, HIGH);
   } else if (bpm > 0 && (bpm < BPM_BRADICARDIA || bpm > BPM_TAQUICARDIA)) {
     digitalWrite(ledPin, HIGH);
@@ -144,7 +208,7 @@ void loop() {
     Serial.print("ADC: "); Serial.print(sinal);
     Serial.print("\tBPM: "); Serial.print(bpm);
 
-    if (botaoPressionado) {
+    if (emergenciaAtiva) {
       Serial.print("\t*** EMERGENCIA ***");
     }
 
