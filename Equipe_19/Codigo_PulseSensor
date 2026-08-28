@@ -1,4 +1,17 @@
-#include <Arduino.h> //biblioteca
+//Declaração das bibliotecas
+#include <Arduino.h>
+#include <WiFi.h>  //para se comunicar com o WiFi
+#include <HTTPClient.h> //para se comunicar com o Supabase (fazer requisições HTTP)
+
+//Informações da rede WiFi
+const char* ssid = "Lopes"; //nome da rede
+const char* password = "leonardoroseli"; //senha da rede
+
+//Informações do Supabase
+//Endereço da tabela leituras na API REST do Supabase
+const char* supabaseUrl = "https://mnylkzpvemsofohfdmrq.supabase.co/rest/v1/leituras";
+//Chave pública usada para autenticação
+const char* anonKey = "sb_publishable_Dhes25fdpmjIw8ebM2C6Ag_BXJ96peU";
 
 //Declaração dos pinos usados
 const int sensorPin = 34; //pino do PulseSensor (entrada analógica)
@@ -23,10 +36,9 @@ const float BPM_TAQUICARDIA = 100.0; //acima disso, em repouso, é considerado t
 const unsigned long periodoRefratario = 300; //tempo mínimo (ms) entre picos válidos (evita falsos positivos por ruído). 300ms = até 200 BPM
 
 //Parâmetros do botão de emergência
-const int CLIQUES_PARA_EMERGENCIA = 5; //quantidade de cliques no botão para gerar uma emergência
-const unsigned long janelaCliques = 4000; //tempo máximo para completar os 5 cliques
+const unsigned long tempoParaAcionarEmergencia = 5000; //segurar o botão por 5s aciona a emergência
 const unsigned long tempoDebounce = 50; //tempo (ms) para ignorar ruído mecânico do botão
-const unsigned long tempoParaCancelarEmergencia = 2000; //segurar o botão por 2s cancela a emergência ativa
+const unsigned long duracaoEmergencia = 5000; //tempo (ms) que a emergência fica ativa antes de sumir sozinha
 
 //Auxiliares e marcação no gráfico
 float media = 0;
@@ -37,7 +49,7 @@ unsigned long tempoUltimaImpressao = 0;
 const unsigned long intervaloImpressao = 1000; //intervalo entre impressões no Serial Monitor (ms). Aumente para deixar mais lento.
 bool acimaLimiar = false; //indica se o sinal está acima do limiar
 int marcador = 0; //identificar onde ocorreu o pico
-unsigned long ultimoPico = 0;
+unsigned long ultimoPico = 0; //calcular o intervalo entre os batimentos
 int contagemPicos = 0; //contador de picos
 float bpm = 0; //contador de bpm
 
@@ -47,9 +59,14 @@ bool estadoBotaoAnterior = HIGH;
 unsigned long tempoUltimoDebounce = 0;
 unsigned long tempoInicioPressao = 0; //instante que o botão for pressionado
 
-int contadorCliques = 0;
-unsigned long tempoPrimeiroClique = 0;
 bool emergenciaAtiva = false; //liga ou desliga o modo emergência
+bool emergenciaJaAcionadaNessaPressao = false; //evita acionar de novo enquanto segura o botão
+unsigned long tempoInicioEmergencia = 0; //instante em que a emergência foi acionada
+
+//Controle de envio para o banco de dados
+unsigned long tempoUltimoEnvio = 0;
+const unsigned long intervaloEnvio = 5000; //envia pro Supabase a cada 5s
+bool ultimaEmergenciaEnviada = false; //guarda o último estado de emergência já enviado
 
 //Funções Auxiliares
 float FiltroMediaMovel(int leitura) {
@@ -60,6 +77,7 @@ float FiltroMediaMovel(int leitura) {
   return somaJanela / janela; //média das 10 amostras
 }
 
+//Zera o filtro de média móvel para recomeçar do zero
 void AtualizaLimiar() {
   float maxTemp = 0;
   float mediaTotal = 0;
@@ -80,6 +98,7 @@ void AtualizaLimiar() {
     delay(4);
   }
 
+  //Média final das 250 leituras
   media = mediaTotal / 250.0;
   maxVal = maxTemp;
   limiar = media + fatorLimiar * (maxVal - media); //define o novo limiar
@@ -123,7 +142,7 @@ void CalculaBPM(float sinal) {
 }
 
 void VerificaBotao() {
-  bool leituraBotao = digitalRead(botaoPin);
+  bool leituraBotao = digitalRead(botaoPin); //lê o estado atual do botão
 
   //debounce: só considera mudança de estado depois de um tempo estável
   if (leituraBotao != estadoBotaoAnterior) {
@@ -137,39 +156,78 @@ void VerificaBotao() {
       if (estadoBotaoAtual == LOW) {
         //borda de descida = botão acabou de ser pressionado
         tempoInicioPressao = millis();
-
-        unsigned long agora = millis();
-        if (contadorCliques == 0 || (agora - tempoPrimeiroClique) <= janelaCliques) {
-          if (contadorCliques == 0) {
-            tempoPrimeiroClique = agora;
-          }
-          contadorCliques++;
-        } else {
-          //passou da janela de tempo, reinicia a contagem com esse clique
-          contadorCliques = 1;
-          tempoPrimeiroClique = agora;
-        }
-
-        //Ao atingir 5 cliques, zera o contador e avisa no serial
-        if (contadorCliques >= CLIQUES_PARA_EMERGENCIA) {
-          emergenciaAtiva = true;
-          contadorCliques = 0;
-          Serial.println("*** EMERGENCIA ACIONADA (5 cliques) ***");
-        }
+        emergenciaJaAcionadaNessaPressao = false; //reseta o controle a cada nova pressão
       }
     }
   }
 
-  //segurar o botão pressionado por tempoParaCancelarEmergencia cancela a emergência
-  if (emergenciaAtiva && estadoBotaoAtual == LOW) {
-    if ((millis() - tempoInicioPressao) >= tempoParaCancelarEmergencia) {
-      emergenciaAtiva = false;
-      contadorCliques = 0;
-      Serial.println("*** EMERGENCIA CANCELADA (botão segurado) ***");
+  //se o botão está sendo segurado, verifica se já passou o tempo pra acionar a emergência
+  if (estadoBotaoAtual == LOW && !emergenciaJaAcionadaNessaPressao) {
+    if ((millis() - tempoInicioPressao) >= tempoParaAcionarEmergencia) {
+      emergenciaAtiva = true;
+      emergenciaJaAcionadaNessaPressao = true; //não aciona de novo até soltar e apertar de novo
+      tempoInicioEmergencia = millis();
+      Serial.println("*** EMERGENCIA ACIONADA (5s segurando o botão) ***");
     }
   }
 
   estadoBotaoAnterior = leituraBotao;
+}
+
+//verifica se já passou o tempo de duração da emergência e desliga sozinha
+void VerificaFimEmergencia() {
+  if (emergenciaAtiva && (millis() - tempoInicioEmergencia >= duracaoEmergencia)) {
+    emergenciaAtiva = false;
+    Serial.println("*** EMERGENCIA ENCERRADA (tempo esgotado) ***");
+  }
+}
+
+//Função para conectar no WiFi
+void ConectaWiFi() {
+  Serial.print("Conectando na rede: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print("."); //indicador visual de que está tentando conectar
+  }
+  //Quando consegue conectar
+  Serial.println("\n✅ WiFi conectado!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+//Funçãp que envia BPM e status de emergência pro Supabase
+void EnviaParaSupabase(float bpmAtual, bool emergencia) {
+  //Verifica se ainda está conectado no WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WiFi desconectado, não foi possível enviar.");
+    return;
+  }
+
+  //Cria o objeto de requisição HTTP
+  HTTPClient http;
+  http.begin(supabaseUrl); //apont para a URL do Supabase
+  http.addHeader("Content-Type", "application/json"); // tipo de conteúdo (JSON)
+  http.addHeader("apikey", anonKey); //chave de autenticação
+
+  //Mostra o texto que vai ser enviado
+  String jsonBody = "{\"bpm\":" + String(bpmAtual) +
+                     ",\"emergencia\":" + String(emergencia ? "true" : "false") + "}";
+
+  int httpCode = http.POST(jsonBody);
+
+  //Verificar se conseguiu enviar os dados para o banco
+  if (httpCode == 201) {
+    Serial.println("✅ Dados enviados ao Supabase!");
+  } else {
+    Serial.print("⚠️ Erro ao enviar. Código: ");
+    Serial.println(httpCode);
+    Serial.println(http.getString());
+  }
+
+  http.end();
 }
 
 
@@ -185,6 +243,8 @@ void setup() {
 
   analogReadResolution(12); // ESP32: ADC de 12 bits (0-4095)
   analogSetAttenuation(ADC_11db); // permite ler até ~3.3V no pino (faixa completa do sinal do PulseSensor)
+
+  ConectaWiFi(); //nova chamada: conecta na rede WiFi antes de começar
 
   AtualizaLimiar();
 }
@@ -203,8 +263,9 @@ void loop() {
   CalculaBPM(sinal); //processa o sinal filtrado para detectar picos e calcular bpm
 
   VerificaBotao();
+  VerificaFimEmergencia(); //verifica se a emergência já deve sumir sozinha
 
-  //emergência ativa (5 cliques) força o LED aceso, independente do BPM
+  //emergência ativa (5s segurando o botão) força o LED aceso, independente do BPM
   //caso contrário, segue a lógica normal de bradicardia/taquicardia
   if (emergenciaAtiva) {
     digitalWrite(ledPin, HIGH);
@@ -225,5 +286,17 @@ void loop() {
     }
 
     Serial.println();
+  }
+
+  //Envia BPM e emergência pro Supabase ---
+  //Envia periodicamente (a cada intervaloEnvio) OU imediatamente se a emergência mudou de estado
+  bool mudouEmergencia = (emergenciaAtiva != ultimaEmergenciaEnviada);
+
+  if (mudouEmergencia || (millis() - tempoUltimoEnvio >= intervaloEnvio)) {
+    if (bpm > 0) { // só envia se já tiver um BPM válido calculado
+      EnviaParaSupabase(bpm, emergenciaAtiva);
+      tempoUltimoEnvio = millis();
+      ultimaEmergenciaEnviada = emergenciaAtiva;
+    }
   }
 }
