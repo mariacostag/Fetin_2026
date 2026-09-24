@@ -4,8 +4,8 @@
 #include <HTTPClient.h> //para se comunicar com o Supabase (fazer requisições HTTP)
 
 //Informações da rede WiFi
-const char* ssid = "Lopes"; //nome da rede
-const char* password = "leonardoroseli"; //senha da rede
+const char* ssid = "iPhone de dudinha "; //nome da rede
+const char* password = "dudinhabutterfly"; //senha da rede
 
 //Informações do Supabase
 //Endereço da tabela leituras na API REST do Supabase
@@ -63,6 +63,12 @@ unsigned long tempoUltimoClique = 0; //instante do último clique confirmado
 
 bool emergenciaAtiva = false; //liga ou desliga o modo emergência
 unsigned long tempoInicioEmergencia = 0; //instante em que a emergência foi acionada
+
+//Controle de piscar do LED
+bool estadoLed = false; //liga/desliga durante o piscar
+unsigned long tempoUltimoToggleLed = 0; //último instante em que o LED trocou de estado
+const unsigned long intervaloPiscaAlerta = 2000; //pisca a cada 2s em caso de bradicardia/taquicardia
+const unsigned long intervaloPiscaEmergencia = 500; //pisca a cada 0,5s durante a emergência
 
 //Controle de envio para o banco de dados
 unsigned long tempoUltimoEnvio = 0;
@@ -281,13 +287,23 @@ void loop() {
   VerificaBotao();
   VerificaFimEmergencia(); //verifica se a emergência já deve sumir sozinha
 
-  //emergência ativa (5s segurando o botão) força o LED aceso, independente do BPM
-  //caso contrário, segue a lógica normal de bradicardia/taquicardia
+  //emergência ativa pisca o LED a cada 1s, independente do BPM
+  //bradicardia/taquicardia pisca o LED a cada 0,5s
+  //fora dessas condições, o LED fica apagado
   if (emergenciaAtiva) {
-    digitalWrite(ledPin, HIGH);
+    if (millis() - tempoUltimoToggleLed >= intervaloPiscaEmergencia) {
+      tempoUltimoToggleLed = millis();
+      estadoLed = !estadoLed;
+      digitalWrite(ledPin, estadoLed);
+    }
   } else if (bpm > 0 && (bpm < BPM_BRADICARDIA || bpm > BPM_TAQUICARDIA)) {
-    digitalWrite(ledPin, HIGH);
+    if (millis() - tempoUltimoToggleLed >= intervaloPiscaAlerta) {
+      tempoUltimoToggleLed = millis();
+      estadoLed = !estadoLed;
+      digitalWrite(ledPin, estadoLed);
+    }
   } else {
+    estadoLed = false;
     digitalWrite(ledPin, LOW);
   }
 
